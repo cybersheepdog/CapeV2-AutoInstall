@@ -162,7 +162,25 @@ stage_host() {
     ( cd "$CAPE_ROOT/installer" && bash ./kvm-qemu.sh all "$CAPE_USER" 2>&1 | tee -a "$LOGFILE" )
     mkdir -p /var/lib/cape-deploy && touch /var/lib/cape-deploy/.kvm-done
   fi
+  ensure_build_tools
   ok "STAGE host complete"
+}
+
+# Utilities capevm.py needs to build guests. Installs only what's missing.
+# NOTE: qemu-utils / virtinst provide qemu-img / virt-install ONLY — they do not
+# replace the custom qemu-system built by kvm-qemu.sh, so the anti-detection
+# QEMU/SeaBIOS patches stay intact.
+ensure_build_tools() {
+  local pkgs=()
+  command -v qemu-img     >/dev/null || pkgs+=(qemu-utils)
+  command -v virt-install >/dev/null || pkgs+=(virtinst)
+  command -v virsh        >/dev/null || pkgs+=(libvirt-clients)
+  command -v xorriso >/dev/null || command -v genisoimage >/dev/null || pkgs+=(xorriso)
+  if [ "${#pkgs[@]}" -gt 0 ]; then
+    log "Installing guest-build tools: ${pkgs[*]}"
+    apt-get update -qq
+    apt-get install -y "${pkgs[@]}" || warn "apt install of ${pkgs[*]} failed — install them manually."
+  fi
 }
 
 write_cape_config() {
@@ -214,6 +232,7 @@ stage_dmi() {
 
 stage_buildvm() {
   log "STAGE buildvm: build analysis guests via capevm.py (stealth-hardened)"
+  ensure_build_tools
   [ -f "$CAPEVM" ] || die "capevm.py not found at $CAPEVM (set CAPEVM=...)."
   [ -f "$INSTALL_ISO" ] || die "INSTALL_ISO not found: $INSTALL_ISO"
   [ -f "$AGENT_PY" ] || die "agent.py not found at $AGENT_PY; run the 'cape' stage first."
@@ -497,9 +516,10 @@ run_stage() {
     smoketest) stage_smoketest ;;
     all)
       preflight; stage_host; stage_cape; stage_community
-      stage_dmi; stage_buildvm; stage_register; stage_netiso; stage_services
-      [ "${ENABLE_TLS:-0}" = "1" ] && stage_tls
-      stage_verify
+      stage_dmi; stage_buildvm; stage_register; stage_netiso
+      stage_services || warn "services stage reported issues — continuing (fix the VM build, then re-run 'services')."
+      [ "${ENABLE_TLS:-0}" = "1" ] && { stage_tls || warn "tls stage reported issues — continuing."; }
+      stage_verify || warn "verify reported issues — review above (non-fatal in 'all')."
       stage_smoketest || warn "smoketest did not pass — review above (non-fatal in 'all')."
       ;;
     *) die "Unknown stage '$1' (host|cape|community|dmi|buildvm|register|netiso|services|tls|verify|smoketest|all)" ;;

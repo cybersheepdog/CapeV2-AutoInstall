@@ -99,6 +99,10 @@ class Config:
     realistic_hw: bool = False          # present a real-CPU topology + DIMM vendor strings
     decoy: bool = True                  # seed "lived-in" user artifacts (Windows)
     decoy_fill_mb: int = 0              # optional filler so free-space ratio looks used (0=off)
+    # Windows 10 Pro generic KMS client key — lets Setup proceed unattended without
+    # activating (fine for a throwaway analysis VM). Override for other editions.
+    product_key: str = "W269N-WFGWX-YVC9B-4J6C9-T83GX"
+    windows_edition: str = "Windows 10 Pro"
     mac: str = ""                       # explicit MAC; blank => generated real-OUI
     computer_name: str = "DESKTOP-7F3K2Q9"   # avoid sandbox-y names
     dmi_profile: str = ""               # JSON profile from 'clone-dmi' (overrides preset)
@@ -138,9 +142,24 @@ def run(cmd: list[str], check: bool = True, quiet: bool = False, capture: bool =
                           capture_output=capture)
 
 
+_TOOL_HINTS = {
+    "qemu-img": "install with 'sudo apt install qemu-utils'. If it IS installed "
+                "(e.g. built into /usr/local/bin by kvm-qemu.sh), make sure that dir "
+                "is in sudo's secure_path — check 'sudo grep secure_path /etc/sudoers'.",
+    "virt-install": "install with 'sudo apt install virtinst'.",
+    "virsh": "install with 'sudo apt install libvirt-clients'.",
+    "xorriso": "install with 'sudo apt install xorriso' (or genisoimage/mkisofs).",
+    "genisoimage": "install with 'sudo apt install genisoimage' (or xorriso).",
+}
+
+
 def need(tool: str):
     if shutil.which(tool) is None:
-        die(f"required tool '{tool}' not found in PATH")
+        hint = _TOOL_HINTS.get(tool)
+        msg = f"required tool '{tool}' not found in PATH"
+        if hint:
+            msg += f"\n    -> {hint}"
+        die(msg)
 
 
 def mkisofs_tool() -> str:
@@ -389,14 +408,17 @@ def render_autounattend(cfg: Config) -> str:
               <InstallTo><DiskID>0</DiskID><PartitionID>1</PartitionID></InstallTo>
               <InstallFrom>
                 <MetaData wcm:action="add" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
-                  <Key>/IMAGE/NAME</Key><Value>Windows 10 Pro</Value>
+                  <Key>/IMAGE/NAME</Key><Value>{cfg.windows_edition}</Value>
                 </MetaData>
               </InstallFrom>
             </OSImage>
           </ImageInstall>
           <UserData>
             <AcceptEula>true</AcceptEula>
-            <ProductKey><WillShowUI>OnError</WillShowUI></ProductKey>
+            <ProductKey>
+              <Key>{cfg.product_key}</Key>
+              <WillShowUI>Never</WillShowUI>
+            </ProductKey>
           </UserData>
         </component>
       </settings>
@@ -1172,6 +1194,8 @@ _SANDBOX_MAP = {
     "REALISTIC_HW": ("realistic_hw", lambda v: str(v).strip() in ("1", "true", "True", "yes")),
     "DECOY": ("decoy", lambda v: str(v).strip() in ("1", "true", "True", "yes")),
     "DECOY_FILL_MB": ("decoy_fill_mb", int),
+    "PRODUCT_KEY": ("product_key", str),
+    "WINDOWS_EDITION": ("windows_edition", str),
 }
 
 
@@ -1238,6 +1262,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--decoy-fill-mb", dest="decoy_fill_mb", type=int, default=None,
                    help="filler MB so guest free-space ratio looks used (0=off)")
     p.add_argument("--mac"); p.add_argument("--computer-name", dest="computer_name")
+    p.add_argument("--product-key", dest="product_key",
+                   help="Windows product key for the answer file (default: Win10 Pro generic KMS key)")
+    p.add_argument("--windows-edition", dest="windows_edition",
+                   help='image edition name, e.g. "Windows 10 Pro"')
     p.add_argument("--dmi-profile", dest="dmi_profile",
                    help="JSON profile from clone-dmi to spoof a real machine's identity")
     p.add_argument("--keep-dmi-serials", dest="dmi_keep_serials", action="store_true",
