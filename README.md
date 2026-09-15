@@ -1,5 +1,10 @@
 # CAPEv2 Automated Deployment + `capevm` Guest Builder
 
+[![Build Status](https://img.shields.io/badge/platform-Linux-blue.svg)](https://shields.io/)
+![Maintenance](https://img.shields.io/maintenance/yes/2026.svg?style=flat-square)
+[![GitHub last commit](https://img.shields.io/github/last-commit/cybersheepdog/CapeV2-AutoInstall.svg?style=flat-square)](https://github.com/cybersheepdog/CapeV2-AutoInstall/commit/master)
+![GitHub](https://img.shields.io/github/license/cybersheepdog/CapeV2-AutoInstall)
+
 Handoff documentation for the two-file pipeline that stands up a CAPEv2 malware
 sandbox on KVM and builds stealth-hardened Windows analysis guests.
 
