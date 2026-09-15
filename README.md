@@ -274,12 +274,116 @@ Relevant `sandbox.conf` keys: `ENABLE_TLS`, `TLS_SERVER_NAME`, `TLS_CERT`,
 > that can submit and detonate malware. `ALLOWED_HOSTS` is set to `['*']` on the
 > assumption the host is isolated; narrow it if your deployment differs.
 
+## Virtualization stack: distro vs. source (`HOST_MODE`)
+
+The `host` stage sets up KVM/QEMU/libvirt. It has two modes:
+
+- **`HOST_MODE=distro` (default, recommended).** Installs `qemu-system-x86`,
+  `libvirt-daemon-system`, `virtinst`, etc. from Ubuntu's repos. These track your
+  kernel and self-heal on `apt upgrade` — no `/usr/local` drift. `capevm.py` still
+  applies all the domain-level stealth (SMBIOS/DMI spoof, hidden hypervisor bit,
+  real-OUI MAC, CPU topology, DIMM/disk strings, decoy profile), so you keep the
+  anti-detection that matters.
+- **`HOST_MODE=source` (opt-in).** Runs CAPE's `kvm-qemu.sh` to build a patched
+  QEMU/SeaBIOS from source, adding deeper firmware-string patches. The trade-off
+  is fragility: the source build installs into `/usr/local`, and every kernel or
+  libvirt update can desync it (missing libs, `libvirt.so` version mismatches,
+  emulator/ROM path issues). Only choose this if you need those firmware patches
+  and are prepared to manage `/usr/local` drift yourself.
+
+Set it in `sandbox.conf` (`HOST_MODE="distro"`) or inline: `sudo HOST_MODE=source ./cape-deploy.sh host`.
+
+## Updating a sandbox host
+
+A malware-analysis host should stay patched, but it should **not** blindly
+auto-upgrade its kernel and virtualization stack — a surprise kernel + reboot is
+how you end up with no display, no `virbr0`, or a broken driver mid-analysis.
+
+Apply the recommended policy (opt-in — it changes unattended-upgrades behavior):
+```
+sudo ./cape-deploy.sh update-policy
+```
+This keeps **security updates auto-installing**, but excludes the kernel and
+qemu/libvirt from the *unattended* timer and disables auto-reboot. Those packages
+remain fully updatable — you just apply them **by hand, deliberately**, during a
+maintenance window with no analysis running.
+
+**Post-kernel-update checklist** (run after `sudo apt upgrade` pulls a new kernel):
+1. Confirm DKMS/driver modules rebuilt for the new kernel (if you run a GPU
+   driver): `dkms status` and `ls /lib/modules/$(uname -r)/`.
+2. Reboot deliberately: `sudo reboot`.
+3. After boot, verify the stack: `sudo virsh net-start default` (should already be
+   autostarted), `ip -br link show virbr0` (UP), `nvidia-smi` if applicable.
+4. Re-check MongoDB — a new kernel can cross the 8.0 incompatibility line; the
+   `deps` stage handles it, or just run `sudo ./cape-deploy.sh deps`.
+5. Smoke-test: `sudo ./cape-deploy.sh smoketest`.
+
+On `HOST_MODE=distro`, most of this self-heals; on `HOST_MODE=source` you may also
+need to reconcile the `/usr/local` qemu/libvirt build after a libvirt update.
+
 ## Troubleshooting
 
-**`CuckooCriticalError: Cannot bind ResultServer on port 2042`**
-The result-server IP/interface isn't up or is mismatched. Ensure `RESULTSERVER_IP`
-is an address on `NETWORK_IFACE`, the bridge is up (`ip link show virbr0`), and
-nothing else holds the port (`ss -lntp | grep 2042`).
+> **What the installer handles for you.** The `deps` stage (part of `all`, or run
+> standalone with `sudo ./cape-deploy.sh deps`) installs and configures the
+> runtime pieces the official CAPE/KVM installers don't reliably leave working:
+> `qemu-img`/`virtinst`/`xorriso`, a **traversable `/etc/poetry`** (else services
+> die with `203/EXEC`), **`libvirt-python`** in CAPE's venv (else the scheduler
+> throws `ModuleNotFoundError: libvirt`), common processing deps, a patched
+> **oscrypto** (else static/report processing fails on OpenSSL 3.x), and a
+> **kernel-aware MongoDB** (MongoDB 8.0 crashes on Linux kernel 6.19+ per
+> SERVER-121912, so on affected kernels it installs MongoDB 7.0 instead). The
+> `register` stage sets both `machinery = kvm` (exactly once) and the
+> `[resultserver] ip` in `cuckoo.conf`. Most of the failures below are therefore
+> handled automatically now — they're kept for reference and manual recovery.
+
+**Report page: "Report doesn't exist anymore! Or maybe just target data is missing"**
+The task shows `reported` and the Mongo doc exists, but the report page errors and
+the doc is missing its `target`/`static` sections. Cause: `oscrypto` (a CAPE
+dependency) can't parse OpenSSL 3.x version strings on Ubuntu 24.04 and raises
+`LibraryNotFoundError: Error detecting the version of libcrypto`, so CAPE's
+static/CAPE processing modules fail to import and write an incomplete report. Fix:
+`sudo -u cape bash -c 'cd /opt/CAPEv2 && /etc/poetry/bin/poetry run pip install --force-reinstall --no-deps "oscrypto @ git+https://github.com/wbond/oscrypto.git@d5f3437"'`
+then `sudo systemctl restart cape-processor cape-web` and **re-run the analysis**
+(existing reports written while it was broken stay incomplete). The `deps` stage
+now does this automatically.
+
+
+**`cape.service` crash-loops with `Failed to execute /etc/poetry/bin/poetry: Permission denied` (203/EXEC)**
+`/etc/poetry` isn't traversable by the non-root `cape` user. Fix:
+`sudo chmod -R o+rX /etc/poetry`. (The `deps` stage does this.)
+
+**`configparser.DuplicateOptionError: option 'machinery' ... already exists`**
+`cuckoo.conf` has two `machinery =` lines. Keep one:
+`sudo sed -i '/^machinery *=/d' /opt/CAPEv2/conf/cuckoo.conf && sudo sed -i '/^\[cuckoo\]/a machinery = kvm' /opt/CAPEv2/conf/cuckoo.conf`.
+(The `register` stage now does this idempotently.)
+
+**`ModuleNotFoundError: No module named 'libvirt'` (scheduler/processor)**
+`libvirt-python` isn't in CAPE's venv. Install build deps then the binding:
+`sudo apt install -y pkg-config libvirt-dev python3-dev` then
+`sudo -u cape bash -c 'cd /opt/CAPEv2 && /etc/poetry/bin/poetry run pip install libvirt-python'`.
+(The `deps` stage does this.)
+
+**`mongod` won't start: "Linux kernel versions 6.19 and newer has a known incompatibility" (SERVER-121912)**
+MongoDB 8.0+ refuses to start on kernel 6.19+. Use MongoDB **7.0** (jammy repo runs
+on noble). The `deps` stage detects the kernel and installs 7.0 automatically.
+
+**`qemu-system-x86_64` symlink loop / "unable to find any emulator" after a source build**
+`kvm-qemu.sh` may install a suffixed binary (e.g. `-spice`) without symlinking it,
+or leave the ROM blobs in `/tmp/qemu-*_builded`. `capevm`'s preflight now detects
+this and prints the fix: symlink the real binary to `/usr/bin/qemu-system-x86_64`,
+`ldconfig` for `/usr/local/lib`, copy `.../usr/share/qemu` into `/usr/share/`, and
+`sudo systemctl restart libvirtd`.
+
+**`CuckooCriticalError: Cannot bind ResultServer on ... :2042`**
+The `[resultserver] ip` in `cuckoo.conf` doesn't match a host address (often left at
+the default `192.168.1.1`). Set it to `RESULTSERVER_IP`:
+`sudo sed -i '/^\[resultserver\]/,/^\[/ s/^ip *=.*/ip = 192.168.122.1/' /opt/CAPEv2/conf/cuckoo.conf`.
+(The `register` stage now sets this.)
+
+**`domain '<vm>' already exists` / "disk already in use by other guests"**
+A stale domain from a failed build. Rebuild cleanly with
+`sudo ./cape-deploy.sh buildvm` after `FORCE=1` (or `capevm.py build --force`),
+which tears the old domain/disk down first.
 
 **Agent never comes up (build times out waiting on the agent)**
 Open the guest console (VNC on `127.0.0.1`) and check `C:\provision.log`. Usual
@@ -288,19 +392,16 @@ match the libvirt subnet; the NIC isn't named `Ethernet` (adjust the `netsh`
 lines in `capevm.py`'s provisioning). Confirm reachability with
 `nc -vz <guest-ip> 8000`.
 
-**Unattended install stops asking for an edition/key**
-The `autounattend.xml` `InstallFrom` value (`Windows 10 Pro`) must match an
-edition in your ISO, or a product key is required. Edit `render_autounattend()`
-in `capevm.py`, or remove the `InstallFrom` block to let Setup choose.
+**Unattended install stops at a Windows Setup / OOBE screen**
+Fixed in current `capevm`: the answer file supplies the Win10 Pro generic key and
+an `oobeSystem` International-Core block that skips region/keyboard/account. A
+stray "Networks" flyout can still appear at first desktop — click **No**;
+provisioning continues underneath.
 
-**`virsh snapshot-list` shows no snapshot / `verify` flags it missing**
-The snapshot is only taken if the agent answered after the stealth reboot. Fix
-provisioning, then run `capevm.py snapshot --name <vm>` once it's up.
-
-**MongoDB won't install / "Mongo >= 5 is not supported"**
-`cape2.sh` checks for the AVX CPU flag. On hosts without AVX it falls back to
-Mongo 4.4; pass `--disable-mongodb-avx-check` to `cape2.sh` only if you know what
-you're doing.
+**MongoDB and the AVX CPU flag**
+MongoDB 5.0+ requires AVX. `cape2.sh` checks for it; on a host without AVX it
+falls back to an older Mongo. Your CPU almost certainly has AVX — this only bites
+very old/virtualized hosts.
 
 **`PermissionError: .../log/cuckoo.log` or qcow2 "not readable"**
 Ownership drift. Most things run as the `cape` user; only the rooter runs as

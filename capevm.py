@@ -88,7 +88,7 @@ class Config:
     work_dir: str = "/opt/capevm/work"
 
     agent_py: str = "/opt/CAPEv2/agent/agent.py"
-    python_installer: str = ""
+    python_installer: str = "/opt/iso/python-3.12.9-x86.exe"
     admin_password: str = "cape1234!"
     locale: str = "en-US"
 
@@ -103,6 +103,7 @@ class Config:
     # activating (fine for a throwaway analysis VM). Override for other editions.
     product_key: str = "W269N-WFGWX-YVC9B-4J6C9-T83GX"
     windows_edition: str = "Windows 10 Pro"
+    force: bool = False                  # tear down an existing domain before building
     mac: str = ""                       # explicit MAC; blank => generated real-OUI
     computer_name: str = "DESKTOP-7F3K2Q9"   # avoid sandbox-y names
     dmi_profile: str = ""               # JSON profile from 'clone-dmi' (overrides preset)
@@ -347,6 +348,44 @@ def cmd_clone_dmi(cfg: Config, from_file: str, out: str):
 # --------------------------------------------------------------------------- #
 # Preflight
 # --------------------------------------------------------------------------- #
+def _kvm_ready() -> tuple[bool, str]:
+    """Return (ok, detail). Verifies libvirt can actually serve a KVM x86_64
+    guest — catches the whole 'emulator not registered / missing libs / missing
+    ROM blobs' class of failure BEFORE we format a disk."""
+    # 1) the emulator binary must run (catches symlink loops, missing libs)
+    exe = shutil.which("qemu-system-x86_64")
+    if not exe:
+        return False, ("qemu-system-x86_64 not found in PATH. If kvm-qemu.sh built a "
+                       "suffixed binary (e.g. qemu-system-x86_64-spice), symlink it: "
+                       "sudo ln -sf /usr/bin/qemu-system-x86_64-spice /usr/bin/qemu-system-x86_64")
+    try:
+        r = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=15)
+        if r.returncode != 0:
+            return False, (f"{exe} --version failed: {r.stderr.strip()[:120]}. "
+                           "Likely missing libs — try: echo /usr/local/lib | sudo tee "
+                           "/etc/ld.so.conf.d/qemu-local.conf && sudo ldconfig")
+    except OSError as e:
+        if "Too many levels of symbolic links" in str(e):
+            return False, ("qemu-system-x86_64 is a symlink loop. Remove it and point it "
+                           "at the real binary: sudo rm -f /usr/bin/qemu-system-x86_64 && "
+                           "sudo ln -sf <real qemu-system-x86_64> /usr/bin/qemu-system-x86_64")
+        return False, f"could not exec {exe}: {e}"
+    # 2) libvirt must advertise a kvm domain for x86_64 (catches 'unable to find
+    #    any emulator' after a source build)
+    try:
+        r = subprocess.run(["virsh", "domcapabilities", "--virttype", "kvm",
+                            "--arch", "x86_64"], capture_output=True, text=True, timeout=20)
+        if r.returncode != 0 or "<domainCapabilities" not in r.stdout:
+            return False, ("libvirt can't serve a KVM x86_64 guest "
+                           f"({(r.stderr or r.stdout).strip()[:120]}). Restart libvirt "
+                           "(sudo systemctl restart libvirtd) after ensuring qemu-system-x86_64 "
+                           "resolves; if it was a source build, its ROM blobs may be missing "
+                           "(sudo cp -a /tmp/qemu-*_builded/usr/share/qemu /usr/share/).")
+    except OSError as e:
+        return False, f"virsh domcapabilities failed: {e}"
+    return True, "libvirt serves KVM x86_64"
+
+
 def preflight(cfg: Config):
     log("Preflight")
     if os.geteuid() != 0:
@@ -355,9 +394,32 @@ def preflight(cfg: Config):
         need(t)
     mkisofs_tool()
     if not Path("/dev/kvm").exists():
-        warn("/dev/kvm missing — is KVM enabled / nested virt on?")
-    if not Path(cfg.install_iso).is_file():
-        die(f"install ISO not found: {cfg.install_iso}")
+        die("/dev/kvm missing — enable Intel VT-x/AMD-V in firmware (or nested virt), "
+            "and load the module: sudo modprobe kvm_intel  (or kvm_amd).")
+    # deep KVM/emulator check — fail here, not halfway through a 120G disk format
+    ready, detail = _kvm_ready()
+    if not ready:
+        die(f"KVM not ready: {detail}")
+    ok(f"KVM check: {detail}")
+    if cfg.platform == "windows":
+        iso = Path(cfg.install_iso)
+        if not iso.is_file():
+            die(f"install ISO not found: {cfg.install_iso}\n"
+                f"    Set INSTALL_ISO in sandbox.conf to the real path (check: ls -l /opt/iso/).")
+        # libvirt/qemu must be able to traverse to and read the ISO, or virt-install
+        # reports 'Size must be specified for non existent volume' even though the
+        # file exists. Make the dir traversable and the ISO world-readable.
+        try:
+            os.chmod(iso, os.stat(iso).st_mode | 0o044)
+            p = iso.parent
+            while True:
+                os.chmod(p, os.stat(p).st_mode | 0o011)   # o+x traverse
+                if str(p) in ("/", str(p.parent)):
+                    break
+                p = p.parent
+        except OSError as e:
+            warn(f"could not adjust ISO path permissions ({e}); "
+                 f"ensure {cfg.install_iso} is readable by the libvirt-qemu user.")
     Path(cfg.work_dir).mkdir(parents=True, exist_ok=True)
     ok("Preflight passed")
 
@@ -371,6 +433,9 @@ def render_autounattend(cfg: Config) -> str:
         r"if exist %d:\provision\provision.cmd "
         r"call %d:\provision\provision.cmd > C:\provision.log 2>&1"
     )
+    # Disable the "Do you want your PC to be discoverable?" network flyout before
+    # OOBE (raw string so the backslashes don't break the f-string below).
+    nla_off = r'cmd /c reg add "HKLM\SYSTEM\CurrentControlSet\Control\Network\NewNetworkWindowOff" /f'
     return textwrap.dedent(f"""\
     <?xml version="1.0" encoding="utf-8"?>
     <unattend xmlns="urn:schemas-microsoft-com:unattend">
@@ -423,7 +488,27 @@ def render_autounattend(cfg: Config) -> str:
         </component>
       </settings>
 
+      <settings pass="specialize">
+        <component name="Microsoft-Windows-Deployment" processorArchitecture="amd64"
+            publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+          <RunSynchronous>
+            <RunSynchronousCommand wcm:action="add" xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+              <Order>1</Order>
+              <Path>{nla_off}</Path>
+              <Description>Disable new-network discoverability prompt</Description>
+            </RunSynchronousCommand>
+          </RunSynchronous>
+        </component>
+      </settings>
+
       <settings pass="oobeSystem">
+        <component name="Microsoft-Windows-International-Core" processorArchitecture="amd64"
+            publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+          <InputLocale>{cfg.locale}</InputLocale>
+          <SystemLocale>{cfg.locale}</SystemLocale>
+          <UILanguage>{cfg.locale}</UILanguage>
+          <UserLocale>{cfg.locale}</UserLocale>
+        </component>
         <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64"
             publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
           <OOBE>
@@ -682,7 +767,35 @@ def create_disk(cfg: Config):
     run(["qemu-img", "create", "-f", "qcow2", cfg.disk_path, f"{cfg.disk_gb}G"])
 
 
+def domain_exists(name: str) -> bool:
+    try:
+        return subprocess.run(["virsh", "dominfo", name],
+                              capture_output=True).returncode == 0
+    except OSError:
+        return False
+
+
 def install(cfg: Config):
+    # Guard against building on top of a half-existing domain/disk. A stale domain
+    # holds a claim on the disk (virt-install: "already in use by other guests")
+    # and reusing an old qcow2 silently builds on last run's state.
+    if domain_exists(cfg.name):
+        if not getattr(cfg, "force", False):
+            die(f"domain '{cfg.name}' already exists. Re-run with --force to tear it "
+                f"down first, or remove it manually:\n"
+                f"  sudo virsh snapshot-delete {cfg.name} clean --metadata 2>/dev/null; "
+                f"sudo virsh undefine {cfg.name} --remove-all-storage")
+        warn(f"--force: tearing down existing domain '{cfg.name}'")
+        subprocess.run(["virsh", "snapshot-delete", cfg.name, "clean", "--metadata"],
+                       capture_output=True)
+        subprocess.run(["virsh", "destroy", cfg.name], capture_output=True)
+        subprocess.run(["virsh", "undefine", cfg.name, "--remove-all-storage"],
+                       capture_output=True)
+        if Path(cfg.disk_path).exists():
+            try:
+                Path(cfg.disk_path).unlink()
+            except OSError:
+                pass
     if cfg.platform == "linux":
         install_linux(cfg)
     else:
@@ -700,14 +813,19 @@ def install_windows(cfg: Config):
         "--vcpus", str(cfg.cpus),
         "--cpu", "host-passthrough",
         "--machine", "pc",
-        "--disk", f"path={cfg.disk_path},format=qcow2,bus=sata",
-        "--disk", f"path={cfg.install_iso},device=cdrom,bus=sata",
-        "--disk", f"path={cfg.seed_iso},device=cdrom,bus=sata",
+        # explicit per-device boot order: install ISO first, then the disk, then
+        # the answer-file seed (never boots, but Windows Setup reads it). Using
+        # boot.order avoids the ambiguous legacy <boot dev='cdrom'/> with two CDs.
+        "--disk", f"path={cfg.disk_path},format=qcow2,bus=sata,boot.order=2",
+        "--disk", f"path={cfg.install_iso},device=cdrom,bus=sata,boot.order=1",
+        "--disk", f"path={cfg.seed_iso},device=cdrom,bus=sata,boot.order=3",
         "--network", f"bridge={cfg.bridge},model=e1000",
         "--graphics", "vnc,listen=127.0.0.1",
         "--video", "qxl",
         "--os-variant", "win10",
-        "--boot", "cdrom,hd",
+        # --import = define + boot our disks as-is (a valid install method for
+        # virt-install) WITHOUT its --cdrom two-phase on_reboot=destroy behavior.
+        "--import",
         "--noautoconsole",
     ]
     run(cmd)
@@ -975,6 +1093,14 @@ def apply_stealth(cfg: Config):
     log("Applying stealth transform to domain XML")
     sm = gen_smbios(cfg)
     cp = run(["virsh", "dumpxml", cfg.name], capture=True, quiet=True)
+
+    # libvirt won't let `virsh define` change an existing domain's UUID, so reuse
+    # the domain's own UUID for the SMBIOS system UUID (it's already random, so
+    # it's just as realistic). This keeps top-level <uuid> and <sysinfo> in sync
+    # AND matching the installed domain, so the redefine updates in place.
+    m = re.search(r"<uuid>\s*([0-9a-fA-F-]{36})\s*</uuid>", cp.stdout)
+    if m:
+        sm["uuid"] = m.group(1).strip()
 
     def _build(mem):
         try:
@@ -1254,6 +1380,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--platform", choices=["windows", "linux"])
     p.add_argument("--cloud-image", dest="cloud_image",
                    help="base qcow2 cloud image for --platform linux")
+    p.add_argument("--force", dest="force", action="store_true", default=None,
+                   help="tear down an existing domain/disk before building")
     p.add_argument("--realistic-hw", dest="realistic_hw", action="store_true",
                    default=None,
                    help="present a realistic CPU topology + DIMM vendor strings")

@@ -3,8 +3,10 @@
 # cape-deploy.sh — Orchestrate a CAPEv2 sandbox build on a dedicated Ubuntu host.
 #
 # Idempotent stages:
-#   host      : clone CAPEv2, run the OFFICIAL kvm-qemu.sh (KVM + anti-VM patches)
+#   host      : clone CAPEv2 + set up KVM/QEMU (HOST_MODE=distro default, or source)
 #   cape      : write a cape-config.sh override, run the OFFICIAL cape2.sh installer
+#   deps      : install runtime deps CAPE needs (poetry perms, libvirt-python, MongoDB)
+#   update-policy : security auto-updates ON; kernel/qemu/libvirt manual-only (opt-in)
 #   community : pull community signatures/parsers
 #   dmi       : (optional) clone a real machine's SMBIOS into a reusable profile
 #   buildvm   : build each analysis guest via capevm.py (unattended install +
@@ -51,6 +53,10 @@ SELF_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 : "${CAPE_ROOT:=/opt/CAPEv2}"
 : "${CAPE_GIT:=https://github.com/kevoreilly/CAPEv2.git}"
 : "${USE_UV:=false}"
+# host virtualization stack: 'distro' (default, reliable, self-updating) installs
+# qemu/libvirt from Ubuntu's repos; 'source' runs CAPE's kvm-qemu.sh to build a
+# patched QEMU/SeaBIOS (extra firmware-string stealth, but fragile across updates).
+: "${HOST_MODE:=distro}"
 : "${DB_PASSWORD:=ChangeMe_SuperSecret}"
 : "${MONGO_ENABLE:=1}"
 
@@ -137,31 +143,58 @@ EOF
 preflight() {
   log "Preflight checks"
   local ver; ver="$(lsb_release -rs 2>/dev/null || echo unknown)"
-  [ "$ver" = "24.04" ] || warn "Ubuntu $ver detected; CAPE officially supports 24.04 LTS."
-  grep -Eq '(vmx|svm)' /proc/cpuinfo || die "CPU virtualization (VT-x/AMD-V) unavailable."
-  [ -e /dev/kvm ] || warn "/dev/kvm missing now (kvm-qemu.sh stage should create it)."
+  [ "$ver" = "24.04" ] || warn "Ubuntu $ver detected; this toolkit targets 24.04 LTS — other releases may need adjustment."
+  grep -Eq '(vmx|svm)' /proc/cpuinfo || die "CPU virtualization (VT-x/AMD-V) unavailable — enable it in firmware."
+  [ -e /dev/kvm ] || warn "/dev/kvm missing now — the 'host' stage will set up KVM (or load kvm_intel/kvm_amd)."
   local free_gb; free_gb="$(df -BG --output=avail / | tail -1 | tr -dc '0-9')"
-  [ "${free_gb:-0}" -ge 100 ] || warn "Only ${free_gb}G free on /. 200G+ recommended."
+  [ "${free_gb:-0}" -ge 100 ] || warn "Only ${free_gb}G free on / — 200G+ recommended (guest disks are thin but grow)."
+  local ram_gb; ram_gb="$(awk '/MemTotal/{printf "%d", $2/1024/1024}' /proc/meminfo 2>/dev/null || echo 0)"
+  [ "${ram_gb:-0}" -ge 16 ] || warn "Only ${ram_gb}G RAM — 16G+ recommended (host services + an 8G guest)."
   command -v git >/dev/null || { apt-get update -qq && apt-get install -y git; }
   ok "Preflight done"
 }
 
 # ----------------------------- stages --------------------------------------
 stage_host() {
-  log "STAGE host: fetch CAPE + install KVM/QEMU with anti-detection patches"
+  log "STAGE host: fetch CAPE + set up the KVM/QEMU virtualization stack (mode=$HOST_MODE)"
   if [ ! -d "$CAPE_ROOT/.git" ]; then
     git clone "$CAPE_GIT" "$CAPE_ROOT"
   else
     ok "CAPE checkout already at $CAPE_ROOT"
   fi
-  [ -f "$CAPE_ROOT/installer/kvm-qemu.sh" ] || die "kvm-qemu.sh not found under $CAPE_ROOT/installer"
-  if [ -e /dev/kvm ] && command -v virsh >/dev/null && [ -f /var/lib/cape-deploy/.kvm-done ]; then
-    ok "KVM stage previously completed; skipping (rm /var/lib/cape-deploy/.kvm-done to force)."
+
+  if [ "$HOST_MODE" = "source" ]; then
+    # Opt-in: build patched QEMU/SeaBIOS from source (fragile across kernel/lib
+    # updates — you'll manage /usr/local drift yourself; see README).
+    [ -f "$CAPE_ROOT/installer/kvm-qemu.sh" ] || die "kvm-qemu.sh not found under $CAPE_ROOT/installer"
+    if [ -e /dev/kvm ] && command -v virsh >/dev/null && [ -f /var/lib/cape-deploy/.kvm-done ]; then
+      ok "KVM stage previously completed; skipping (rm /var/lib/cape-deploy/.kvm-done to force)."
+    else
+      warn "HOST_MODE=source: building QEMU/SeaBIOS from source into /usr/local (slow, fragile)."
+      log "Running official kvm-qemu.sh"
+      ( cd "$CAPE_ROOT/installer" && bash ./kvm-qemu.sh all "$CAPE_USER" 2>&1 | tee -a "$LOGFILE" )
+      mkdir -p /var/lib/cape-deploy && touch /var/lib/cape-deploy/.kvm-done
+    fi
   else
-    log "Running official kvm-qemu.sh (patches+rebuilds QEMU/SeaBIOS — slow)"
-    ( cd "$CAPE_ROOT/installer" && bash ./kvm-qemu.sh all "$CAPE_USER" 2>&1 | tee -a "$LOGFILE" )
-    mkdir -p /var/lib/cape-deploy && touch /var/lib/cape-deploy/.kvm-done
+    # Default: distro packages. These track the kernel and self-heal on apt
+    # upgrade — no /usr/local drift. capevm.py still applies domain-level stealth
+    # (SMBIOS/DMI/CPU/MAC), so you keep the anti-detection that matters; you only
+    # forgo kvm-qemu.sh's deeper firmware-string patches.
+    log "Installing distro KVM/QEMU/libvirt (apt) — reliable + self-updating"
+    apt-get update -qq
+    apt-get install -y \
+      qemu-system-x86 qemu-utils \
+      libvirt-daemon-system libvirt-daemon libvirt-clients libvirt0 \
+      virtinst ovmf bridge-utils xorriso \
+      || die "failed to install distro virtualization packages"
+    systemctl enable --now libvirtd 2>/dev/null \
+      || systemctl enable --now virtqemud virtnetworkd virtstoraged 2>/dev/null || true
+    # let the invoking (sudo) user manage libvirt without root
+    [ -n "${SUDO_USER:-}" ] && usermod -aG libvirt,kvm "$SUDO_USER" 2>/dev/null || true
+    ensure_network || warn "default libvirt network not up yet — will retry at buildvm."
+    ok "distro virtualization stack installed."
   fi
+
   ensure_build_tools
   ok "STAGE host complete"
 }
@@ -181,6 +214,174 @@ ensure_build_tools() {
     apt-get update -qq
     apt-get install -y "${pkgs[@]}" || warn "apt install of ${pkgs[*]} failed — install them manually."
   fi
+}
+
+# Sane update policy for a sandbox host: keep security updates flowing, but never
+# let the kernel or the virtualization stack auto-upgrade/reboot underneath a
+# running analysis. They stay fully updatable via a *manual* apt upgrade in a
+# maintenance window (this only affects the UNATTENDED timer, not `apt` by hand).
+stage_update_policy() {
+  log "STAGE update-policy: auto security updates ON; kernel/qemu/libvirt excluded from auto-upgrade"
+  apt-get install -y unattended-upgrades >/dev/null 2>&1 || true
+  cat > /etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+EOF
+  cat > /etc/apt/apt.conf.d/52cape-unattended <<'EOF'
+// CAPE sandbox host policy — see README "Updating a sandbox host".
+// Auto-apply SECURITY updates, but exclude the kernel and virtualization stack
+// from the unattended timer and never auto-reboot. You still update those by
+// hand ("sudo apt upgrade") in a maintenance window, then reboot deliberately.
+Unattended-Upgrade::Allowed-Origins {
+    "${distro_id}:${distro_codename}-security";
+    "${distro_id}ESMApps:${distro_codename}-apps-security";
+    "${distro_id}ESM:${distro_codename}-infra-security";
+};
+Unattended-Upgrade::Package-Blacklist {
+    "linux-image";
+    "linux-headers";
+    "linux-generic";
+    "qemu-system";
+    "qemu-utils";
+    "libvirt";
+};
+Unattended-Upgrade::Automatic-Reboot "false";
+EOF
+  systemctl restart unattended-upgrades 2>/dev/null || true
+  ok "Update policy applied: security updates auto-install; kernel/qemu/libvirt stay for manual, controlled upgrades; no auto-reboot."
+  log "When you DO take a kernel update, follow the post-kernel-update checklist in the README."
+}
+
+
+# Kernel-aware MongoDB install. MongoDB 8.0+ crashes on Linux kernel 6.19+
+# (SERVER-121912), so on affected kernels we install 7.0 instead.
+ensure_mongodb() {
+  # Desired major: MongoDB 8.0+ crashes on Linux kernel >= 6.19 (SERVER-121912),
+  # so on affected kernels we want 7.0; otherwise 8.0.
+  local rel kmm want repocode installed_major want_major
+  rel="$(uname -r)"; kmm="$(echo "$rel" | grep -oE '^[0-9]+\.[0-9]+')"
+  want="8.0"
+  if awk -v k="$kmm" 'BEGIN{split(k,a,".");exit !(a[1]>6||(a[1]==6&&a[2]>=19))}'; then
+    want="7.0"
+    warn "Kernel $rel is affected by MongoDB SERVER-121912 — MongoDB 7.0 required (not 8.0)."
+  fi
+  want_major="${want%%.*}"
+  installed_major="$(dpkg-query -W -f='${Version}' mongodb-org-server 2>/dev/null | grep -oE '^[0-9]+' || true)"
+
+  # Already the right major AND running? Nothing to do.
+  if [ "$installed_major" = "$want_major" ] && systemctl is-active --quiet mongod 2>/dev/null; then
+    ok "MongoDB ${want} already installed and running."
+    return 0
+  fi
+
+  # An incompatible major is installed (this is the loop: cape2.sh installs 8.0,
+  # apt then says 'already newest' so a plain install is a no-op). Purge it first.
+  if [ -n "$installed_major" ] && [ "$installed_major" != "$want_major" ]; then
+    warn "Removing incompatible MongoDB ${installed_major}.x before installing ${want}."
+    systemctl stop mongod 2>/dev/null || true
+    pkill -9 mongod 2>/dev/null || true
+    apt-mark unhold 'mongodb-org*' >/dev/null 2>&1 || true
+    apt-get purge -y 'mongodb-org*' >/dev/null 2>&1 || true
+    apt-get autoremove -y >/dev/null 2>&1 || true
+    rm -f /etc/apt/sources.list.d/mongodb-org-*.list
+  fi
+
+  log "Installing MongoDB $want"
+  apt-get install -y gnupg curl >/dev/null 2>&1 || true
+  install -d /etc/apt/keyrings
+  curl -fsSL "https://www.mongodb.org/static/pgp/server-${want}.asc" \
+    | gpg --batch --yes -o /etc/apt/keyrings/mongo.gpg --dearmor 2>/dev/null
+  chmod 644 /etc/apt/keyrings/mongo.gpg
+  repocode="$(. /etc/os-release 2>/dev/null; echo "${UBUNTU_CODENAME:-noble}")"
+  [ "$want" = "7.0" ] && repocode="jammy"   # 7.0 has no noble repo; jammy pkgs run on noble
+  rm -f /etc/apt/sources.list.d/mongodb-org-*.list
+  echo "deb [ arch=amd64,arm64 signed-by=/etc/apt/keyrings/mongo.gpg ] https://repo.mongodb.org/apt/ubuntu ${repocode}/mongodb-org/${want} multiverse" \
+    > "/etc/apt/sources.list.d/mongodb-org-${want}.list"
+  apt-get update >/dev/null 2>&1 || true   # tolerate unrelated repo key errors
+  apt-mark unhold 'mongodb-org*' >/dev/null 2>&1 || true
+  if ! apt-get install -y mongodb-org; then
+    warn "mongodb-org ${want} install failed — CAPE report processing needs Mongo. Install it manually."
+    return 0   # non-fatal: never abort the whole deploy on this
+  fi
+
+  # PIN the correct version so the 'cape' stage (cape2.sh) can NEVER pull 8.0 back.
+  apt-mark hold mongodb-org mongodb-org-server mongodb-org-database mongodb-org-mongos \
+    mongodb-org-tools mongodb-mongosh mongodb-database-tools >/dev/null 2>&1 || true
+
+  chown -R mongodb:mongodb /var/lib/mongodb /var/log/mongodb 2>/dev/null || true
+  systemctl enable --now mongod >/dev/null 2>&1 || true
+  sleep 4
+  if systemctl is-active --quiet mongod; then
+    ok "MongoDB ${want} running on 127.0.0.1:27017 (held/pinned so 8.0 can't return)."
+  else
+    warn "mongod not active — see 'journalctl -u mongod'."
+  fi
+  return 0   # never fail the stage on mongo
+}
+
+# Runtime dependencies CAPE needs that the official installers don't reliably
+# leave in place: traversable poetry path, libvirt-python in the venv, MongoDB.
+stage_deps() {
+  log "STAGE deps: ensure CAPE runtime dependencies (poetry perms, libvirt-python, MongoDB)"
+
+  # 1) poetry path must be traversable by the (non-root) cape service user,
+  #    otherwise services die with 203/EXEC "Permission denied" on poetry.
+  if [ -d /etc/poetry ]; then
+    chmod -R o+rX /etc/poetry && ok "poetry path made traversable (o+rX)"
+  fi
+
+  # 2) libvirt-python in CAPE's venv (KVM machinery imports it; without it the
+  #    scheduler/processor crash with ModuleNotFoundError: libvirt).
+  if [ -d "$CAPE_ROOT" ] && [ -x /etc/poetry/bin/poetry ]; then
+    apt-get install -y pkg-config libvirt-dev python3-dev gcc >/dev/null 2>&1 \
+      || warn "could not install libvirt build deps (pkg-config/libvirt-dev)"
+    chown -R "$CAPE_USER":"$CAPE_USER" "$CAPE_ROOT/.cache" 2>/dev/null || true
+    local pcp="/usr/local/lib/pkgconfig:/usr/local/lib64/pkgconfig:/usr/lib/x86_64-linux-gnu/pkgconfig"
+    if sudo -u "$CAPE_USER" bash -c "cd '$CAPE_ROOT' && PKG_CONFIG_PATH='$pcp' /etc/poetry/bin/poetry run python -c 'import libvirt' 2>/dev/null"; then
+      ok "libvirt-python already present in CAPE venv"
+    else
+      log "Installing libvirt-python into CAPE venv"
+      sudo -u "$CAPE_USER" bash -c "cd '$CAPE_ROOT' && PKG_CONFIG_PATH='$pcp' /etc/poetry/bin/poetry run pip install libvirt-python" \
+        && ok "libvirt-python installed" \
+        || warn "libvirt-python install failed — check libvirt-dev/pkg-config (or a /usr/local source build)."
+    fi
+    # commonly-needed processing deps (non-fatal if they fail)
+    sudo -u "$CAPE_USER" bash -c "cd '$CAPE_ROOT' && /etc/poetry/bin/poetry run pip install -q pyzipper certvalidator asn1crypto mscerts" >/dev/null 2>&1 \
+      && ok "optional processing deps present" \
+      || warn "some optional processing deps not installed (non-fatal)."
+
+    # oscrypto: the PyPI release can't parse OpenSSL 3.x version strings (double-digit
+    # patch, e.g. 3.0.13 on Ubuntu 24.04) and raises LibraryNotFoundError, which makes
+    # CAPE's static/CAPE processing modules fail to import — reports then land without
+    # the target/static sections and the web report page errors. Detect + repair.
+    _osc_ok() { sudo -u "$CAPE_USER" bash -c \
+      "cd '$CAPE_ROOT' && /etc/poetry/bin/poetry run python -c 'import oscrypto._openssl._libcrypto_cffi' 2>/dev/null"; }
+    _osc_install() { sudo -u "$CAPE_USER" bash -c \
+      "cd '$CAPE_ROOT' && /etc/poetry/bin/poetry run pip install --force-reinstall --no-deps 'oscrypto @ git+https://github.com/wbond/oscrypto.git@$1'" >/dev/null 2>&1; }
+    if _osc_ok; then
+      ok "oscrypto OK for this OpenSSL."
+    else
+      log "Patching oscrypto for OpenSSL 3.x (LibraryNotFoundError fix)"
+      _osc_install "d5f3437" || true                 # known-good pinned commit
+      if ! _osc_ok; then
+        warn "pinned oscrypto commit didn't resolve it; trying oscrypto master."
+        _osc_install "master" || true                # maintained fix, for future OpenSSL bumps
+      fi
+      if _osc_ok; then
+        ok "oscrypto patched (OpenSSL 3.x compatible)."
+      else
+        warn "oscrypto still failing — CAPE static/report processing may be degraded "
+        warn "(reports may lack target/static; see 'journalctl -u cape-processor')."
+      fi
+    fi
+  else
+    warn "CAPE_ROOT or /etc/poetry/bin/poetry not found — run the 'cape' stage first."
+  fi
+
+  # 3) MongoDB (kernel-aware — handles the 8.0/kernel-6.19 incompatibility)
+  ensure_mongodb
+
+  ok "STAGE deps complete"
 }
 
 write_cape_config() {
@@ -230,9 +431,55 @@ stage_dmi() {
   ok "STAGE dmi complete -> $DMI_PROFILE"
 }
 
+# Ensure the libvirt default network / bridge is up before we build a guest.
+# Also repairs the loader cache for source-built libvirt/qemu in /usr/local
+# (kvm-qemu.sh installs there; if those libs aren't on the loader path, helpers
+# like libvirt_leaseshelper die with "version LIBVIRT_PRIVATE_x not found",
+# which stops the default network and leaves no virbr0).
+ensure_network() {
+  local changed=0 d
+  for d in /usr/local/lib /usr/local/lib64 /usr/local/lib/x86_64-linux-gnu; do
+    [ -d "$d" ] || continue
+    grep -qxF "$d" /etc/ld.so.conf.d/zz-cape-local.conf 2>/dev/null || {
+      echo "$d" >> /etc/ld.so.conf.d/zz-cape-local.conf; changed=1; }
+  done
+  [ "$changed" = 1 ] && { ldconfig; log "refreshed loader cache for /usr/local libs"; }
+
+  systemctl restart libvirtd 2>/dev/null \
+    || systemctl restart virtqemud virtnetworkd virtstoraged 2>/dev/null || true
+
+  # define default net if missing, then autostart + start it
+  if ! virsh net-info default >/dev/null 2>&1; then
+    for def in /usr/share/libvirt/networks/default.xml \
+               /etc/libvirt/qemu/networks/default.xml; do
+      [ -f "$def" ] && { virsh net-define "$def" >/dev/null 2>&1 && break; }
+    done
+  fi
+  virsh net-autostart default >/dev/null 2>&1 || true
+  virsh net-info default 2>/dev/null | grep -qi 'active:.*yes' \
+    || virsh net-start default >/dev/null 2>&1 || true
+
+  if ip link show "${VM_BRIDGE:-virbr0}" >/dev/null 2>&1; then
+    ok "libvirt network up (${VM_BRIDGE:-virbr0} present)"
+    return 0
+  fi
+  warn "Bridge ${VM_BRIDGE:-virbr0} is not up — 'virsh net-start default' failed."
+  warn "Most common cause: a broken/mismatched libvirt from the source build."
+  warn "Check:  sudo virsh net-start default"
+  warn "If it reports \"LIBVIRT_PRIVATE_x.x.x not found\", your libvirt binaries and"
+  warn "libraries are out of sync. Reconcile them, e.g.:"
+  warn "  sudo apt install --reinstall libvirt-daemon-system libvirt-daemon libvirt-clients libvirt0"
+  warn "  sudo ldconfig && sudo systemctl restart libvirtd && sudo virsh net-start default"
+  return 1
+}
+
 stage_buildvm() {
   log "STAGE buildvm: build analysis guests via capevm.py (stealth-hardened)"
   ensure_build_tools
+  if ! ensure_network; then
+    warn "Skipping VM build — no usable libvirt bridge. Fix libvirt/network above, then re-run 'buildvm'."
+    return 1
+  fi
   [ -f "$CAPEVM" ] || die "capevm.py not found at $CAPEVM (set CAPEVM=...)."
   [ -f "$INSTALL_ISO" ] || die "INSTALL_ISO not found: $INSTALL_ISO"
   [ -f "$AGENT_PY" ] || die "agent.py not found at $AGENT_PY; run the 'cape' stage first."
@@ -259,6 +506,7 @@ will lack x86 Python unless you fix this."
     platform="${platform:-windows}"
     log "Building $platform VM '$name' ($ip, snapshot '$snap')"
     local plat_args=(--platform "$platform")
+    [ "${FORCE:-0}" = "1" ] && plat_args+=(--force)
     if [ "$platform" = "linux" ]; then
       [ -n "${CLOUD_IMAGE:-}" ] || { warn "VM '$name' is linux but CLOUD_IMAGE unset — skipping."; failures=$((failures+1)); continue; }
       plat_args+=(--cloud-image "$CLOUD_IMAGE")
@@ -317,23 +565,37 @@ EOF
 
   if [ -f "$cuckooconf" ]; then
     cp -a "$cuckooconf" "${cuckooconf}.bak.$(date +%s)"
-    grep -q '^machinery' "$cuckooconf" && sed -i 's/^machinery.*/machinery = kvm/' "$cuckooconf"
-    ok "Set machinery = kvm in cuckoo.conf (backup saved)"
+    # machinery: ensure EXACTLY ONE line, under [cuckoo] (a duplicate makes CAPE's
+    # config parser throw DuplicateOptionError and cape.service crash-loops).
+    sed -i '/^machinery[[:space:]]*=/d' "$cuckooconf"
+    sed -i '/^\[cuckoo\]/a machinery = kvm' "$cuckooconf"
+    # resultserver IP: CAPE binds the result server from cuckoo.conf's
+    # [resultserver] ip, NOT from kvm.conf. If it's left at the default
+    # (192.168.1.1) the bind fails with "Cannot assign requested address".
+    if grep -q '^\[resultserver\]' "$cuckooconf"; then
+      sed -i "/^\[resultserver\]/,/^\[/ s/^ip[[:space:]]*=.*/ip = $RESULTSERVER_IP/" "$cuckooconf"
+      sed -i "/^\[resultserver\]/,/^\[/ s/^port[[:space:]]*=.*/port = $RESULTSERVER_PORT/" "$cuckooconf"
+    fi
+    ok "Set machinery = kvm and [resultserver] ip = $RESULTSERVER_IP in cuckoo.conf (backup saved)"
   else
-    warn "cuckoo.conf not found; set [cuckoo] machinery = kvm manually."
+    warn "cuckoo.conf not found; set [cuckoo] machinery = kvm and [resultserver] ip = $RESULTSERVER_IP manually."
   fi
   ok "STAGE register complete"
 }
 
 stage_services() {
   log "STAGE services: restart and verify CAPE services"
-  local svcs=(cape.service cape-processor.service cape-web.service cape-rooter.service)
+  # order matters: rooter + main scheduler come up before web/processor
+  local svcs=(cape-rooter.service cape.service cape-web.service cape-processor.service)
   systemctl daemon-reload || true
   for s in "${svcs[@]}"; do
-    if systemctl list-unit-files | grep -q "^$s"; then
+    # `systemctl cat` is a format-independent existence test (grepping
+    # list-unit-files text is fragile across systemd versions).
+    if systemctl cat "$s" >/dev/null 2>&1; then
       systemctl enable "$s" >/dev/null 2>&1 || true
+      systemctl reset-failed "$s" >/dev/null 2>&1 || true
       systemctl restart "$s" || warn "Failed to restart $s"
-      sleep 1
+      sleep 2
       systemctl is-active --quiet "$s" && ok "$s active" || warn "$s NOT active — journalctl -u $s"
     else
       warn "$s not installed (was 'cape' run?)"
@@ -421,6 +683,14 @@ EOF
       chown "$CAPE_USER":"$CAPE_USER" "$settings" 2>/dev/null || true
       ok "Patched Django ALLOWED_HOSTS / CSRF_TRUSTED_ORIGINS (backup saved)."
       systemctl restart cape-web.service 2>/dev/null || warn "restart cape-web manually."
+      # give cape-web time to rebind :$WEB_PORT before verify/handoff checks it
+      if _port_up "$WEB_PORT"; then
+        ok "cape-web back up on :$WEB_PORT."
+      else
+        warn "cape-web not listening on :$WEB_PORT yet — check 'journalctl -u cape-web'."
+        warn "If it crash-loops, the settings patch may not fit your CAPE version; the"
+        warn "pre-TLS backup is at ${settings}.bak.* — restore it and restart cape-web."
+      fi
     fi
   else
     warn "Django settings not found at $settings — add ALLOWED_HOSTS / "
@@ -441,6 +711,17 @@ _check() {  # _check "label" <command...>  -> prints PASS/FAIL, bumps counter
   fi
 }
 
+# a listener may take a few seconds to (re)bind after a service restart, so poll
+# rather than checking once (avoids false negatives right after tls/services).
+_port_up() {  # _port_up <port>  -> 0 if something is listening within ~20s
+  local p="$1" i
+  for i in $(seq 1 20); do
+    ss -lntH "sport = :$p" 2>/dev/null | grep -q . && return 0
+    sleep 1
+  done
+  return 1
+}
+
 stage_verify() {
   log "STAGE verify: health checks"
   VERIFY_FAILS=0
@@ -451,11 +732,9 @@ stage_verify() {
     _check "$s active" systemctl is-active --quiet "$s"
   done
 
-  # resultserver + web listening (ss returns 0 only if a match is printed)
-  _check "resultserver listening :$RESULTSERVER_PORT" \
-    bash -c "ss -lntH 'sport = :$RESULTSERVER_PORT' | grep -q ."
-  _check "web listening :$WEB_PORT" \
-    bash -c "ss -lntH 'sport = :$WEB_PORT' | grep -q ."
+  # resultserver + web listening (retry — they can lag a service restart)
+  _check "resultserver listening :$RESULTSERVER_PORT" _port_up "$RESULTSERVER_PORT"
+  _check "web listening :$WEB_PORT" _port_up "$WEB_PORT"
 
   # per-VM: domain defined + named snapshot exists + agent port reachable
   for entry in "${VM_LIST[@]}"; do
@@ -487,7 +766,8 @@ stage_netiso() {
     gateway)   args+=(--gateway-iface "$GATEWAY_IFACE") ;;
     simulated) args+=(--fakenet-ip "$FAKENET_IP") ;;
   esac
-  bash "$NETISO" "${args[@]}" 2>&1 | tee -a "$LOGFILE"
+  bash "$NETISO" "${args[@]}" 2>&1 | tee -a "$LOGFILE" \
+    || warn "netiso apply returned non-zero — isolation may still be active; check 'netiso.sh status'."
   bash "$NETISO" verify --mode "$ISO_MODE" --gateway-iface "$GATEWAY_IFACE" 2>&1 | tee -a "$LOGFILE" || true
   ok "STAGE netiso complete"
 }
@@ -505,6 +785,8 @@ run_stage() {
   case "$1" in
     host)      stage_host ;;
     cape)      stage_cape ;;
+    deps)      stage_deps ;;
+    update-policy) stage_update_policy ;;
     community) stage_community ;;
     dmi)       stage_dmi ;;
     buildvm)   stage_buildvm ;;
@@ -515,14 +797,20 @@ run_stage() {
     verify)    stage_verify ;;
     smoketest) stage_smoketest ;;
     all)
-      preflight; stage_host; stage_cape; stage_community
-      stage_dmi; stage_buildvm; stage_register; stage_netiso
+      # a full run should be hands-off: auto-clean a stale domain/disk left by a
+      # previous failed attempt instead of stopping. (Override with FORCE=0.)
+      : "${FORCE:=1}"; export FORCE
+      preflight; stage_host; stage_cape
+      stage_deps || warn "deps stage reported issues — continuing (fix MongoDB/deps, then re-run 'deps')."
+      stage_community
+      stage_dmi; stage_buildvm; stage_register
+      stage_netiso || warn "netiso reported issues — continuing (verify with 'netiso.sh status')."
       stage_services || warn "services stage reported issues — continuing (fix the VM build, then re-run 'services')."
       [ "${ENABLE_TLS:-0}" = "1" ] && { stage_tls || warn "tls stage reported issues — continuing."; }
       stage_verify || warn "verify reported issues — review above (non-fatal in 'all')."
       stage_smoketest || warn "smoketest did not pass — review above (non-fatal in 'all')."
       ;;
-    *) die "Unknown stage '$1' (host|cape|community|dmi|buildvm|register|netiso|services|tls|verify|smoketest|all)" ;;
+    *) die "Unknown stage '$1' (host|cape|deps|community|dmi|buildvm|register|netiso|services|tls|verify|smoketest|update-policy|all)" ;;
   esac
 }
 
